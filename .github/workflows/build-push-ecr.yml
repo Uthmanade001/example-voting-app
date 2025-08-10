@@ -1,17 +1,18 @@
-name: Build and Push to ECR
-
+name: Build & Push to ECR
 on:
   push:
-    branches: ["main"]
+    branches: [ main ]
   workflow_dispatch:
 
-jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
+permissions:
+  id-token: write
+  contents: read
 
+jobs:
+  build:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -20,33 +21,35 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Login to Amazon ECR
-        id: login-ecr
+      - name: Login to ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      # Build and push vote
-      - name: Build and push vote image
-        uses: docker/build-push-action@v6
+      # Build & push VOTE
+      - name: Build & push vote
+        uses: docker/build-push-action@v5
         with:
           context: ./vote
           push: true
           tags: |
             ${{ secrets.ECR_REGISTRY }}/vote:latest
+            ${{ secrets.ECR_REGISTRY }}/vote:${{ github.sha }}
 
-      # Build and push worker
-      - name: Build and push worker image
-        uses: docker/build-push-action@v6
+      # Build & push WORKER
+      - name: Build & push worker
+        uses: docker/build-push-action@v5
         with:
           context: ./worker
           push: true
           tags: |
             ${{ secrets.ECR_REGISTRY }}/worker:latest
+            ${{ secrets.ECR_REGISTRY }}/worker:${{ github.sha }}
 
-      # Build and push result
-      - name: Build and push result image
-        uses: docker/build-push-action@v6
+      # Build & push RESULT
+      - name: Build & push result
+        uses: docker/build-push-action@v5
         with:
           context: ./result
           push: true
           tags: |
             ${{ secrets.ECR_REGISTRY }}/result:latest
+            ${{ secrets.ECR_REGISTRY }}/result:${{ github.sha }}

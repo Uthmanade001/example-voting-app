@@ -18,7 +18,7 @@ services:
     restart: unless-stopped
 
   vote:
-    image: 389890955868.dkr.ecr.eu-west-2.amazonaws.com/vote:latest
+    image: ${ECR_REGISTRY}/vote:${IMAGE_TAG:-latest}
     ports:
       - "5000:80"
     depends_on:
@@ -27,14 +27,14 @@ services:
     restart: unless-stopped
 
   worker:
-    image: 389890955868.dkr.ecr.eu-west-2.amazonaws.com/worker:latest
+    image: ${ECR_REGISTRY}/worker:${IMAGE_TAG:-latest}
     depends_on:
       - redis
       - db
     restart: unless-stopped
 
   result:
-    image: 389890955868.dkr.ecr.eu-west-2.amazonaws.com/result:latest
+    image: ${ECR_REGISTRY}/result:${IMAGE_TAG:-latest}
     ports:
       - "5001:80"
     depends_on:
