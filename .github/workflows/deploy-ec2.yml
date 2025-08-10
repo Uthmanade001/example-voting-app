@@ -44,44 +44,45 @@ jobs:
 
       # ✅ REPLACEMENT STEP: locate and package the compose from the right folder
       - name: Locate & package docker-compose
+        shell: bash
         run: |
           set -e
           echo "Looking for: ${COMPOSE_PATH}"
           if [ ! -f "${COMPOSE_PATH}" ]; then
-            echo "ERROR: Could not find ${COMPOSE_PATH} in the repo."
+            echo "ERROR: Could not find ${COMPOSE_PATH}."
             echo "Repo tree (top level):"; ls -la
             exit 1
           fi
+          echo "Compose file size: $(wc -c < "${COMPOSE_PATH}") bytes"
           base64 -w0 "${COMPOSE_PATH}" > compose.b64
+          echo "Base64 size: $(wc -c < compose.b64) bytes"
           echo "COMPOSE_B64=$(cat compose.b64)" >> $GITHUB_ENV
+
 
       - name: Send SSM Run Command (deploy)
         id: ssm
         shell: bash
         run: |
-          set -euo pipefail
-          read -r -d '' USER_SCRIPT <<'EOS'
-          set -euo pipefail
+          set -eo pipefail
 
-          sudo yum -y install docker || true
-          sudo systemctl enable --now docker
-          sudo usermod -aG docker ec2-user || true
-
-          # docker compose v2 shim
-          if ! docker compose version >/dev/null 2>&1; then
-            sudo curl -L "https://github.com/docker/compose/releases/download/v2.27.1/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-            sudo chmod +x /usr/local/bin/docker-compose
-            sudo ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+          # Ensure COMPOSE_B64 is present (avoid empty/unset errors)
+          if [ -z "${COMPOSE_B64:-}" ]; then
+            echo "ERROR: COMPOSE_B64 is empty or unset. Packaging step likely failed."
+            exit 1
           fi
 
-          sudo mkdir -p /opt/vote
-          sudo chown -R ec2-user:ec2-user /opt/vote
+          read -r -d '' USER_SCRIPT <<'EOS'
+          set -euo pipefail
           cd /opt/vote
 
           # Write compose and env values
           echo "$COMPOSE_B64" | base64 -d > docker-compose.yml
           export ECR_REGISTRY="${ECR_REGISTRY}"
           export IMAGE_TAG="${IMAGE_TAG}"
+          ...
+          EOS
+          ...
+
 
           # ECR login + pull & restart
           aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
