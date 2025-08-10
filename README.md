@@ -63,3 +63,139 @@ The voting application only accepts one vote per client browser. It does not reg
 This isn't an example of a properly architected perfectly designed distributed app... it's just a simple
 example of the various types of pieces and languages you might see (queues, persistent data, etc), and how to
 deal with them in Docker at a basic level.
+
+
+
+
+CI/CD to AWS ECR + EC2 (Example Voting App)
+This project ships two GitHub Actions workflows:
+
+Workflow 1 — Build & Push to ECR (.github/workflows/build-push-ecr.yml)
+Builds Docker images for vote, worker, result, tags them as latest and short commit SHA, and pushes to Amazon ECR.
+
+Workflow 2 — Deploy to EC2 via SSM (.github/workflows/deploy-ec2.yml)
+Uses AWS Systems Manager (SSM) Run Command to SSH‑less deploy: logs in to ECR on the instance, runs docker compose pull && docker compose up -d.
+
+Repo Layout (expected)
+bash
+Copy code
+example-voting-app/
+  vote/      # Dockerfile inside
+  worker/    # Dockerfile inside
+  result/    # Dockerfile inside
+  .github/workflows/
+    build-push-ecr.yml
+    deploy-ec2.yml
+  infra/ (optional)
+One‑time AWS Setup
+ECR Repos
+
+Create repositories: vote, worker, result (region: eu-west-2).
+
+Example registry: 389890955868.dkr.ecr.eu-west-2.amazonaws.com.
+
+EC2 Instance
+
+Amazon Linux 2023, public subnet + Elastic IP.
+
+Security Group: allow TCP 22 (SSH) from your IP, 5000 (vote UI), 5001 (result UI).
+
+IAM Role attached:
+
+AmazonEC2ContainerRegistryReadOnly
+
+AmazonSSMManagedInstanceCore (required for SSM deploy)
+
+Compose on EC2
+
+/opt/vote/docker-compose.yml uses ECR images for vote/worker/result.
+
+Add restart: always to services.
+
+Optional: cron or systemd on reboot to docker compose pull && up -d.
+
+GitHub Secrets (Repository → Settings → Secrets and variables → Actions)
+Required for both workflows:
+
+AWS_ACCESS_KEY_ID
+
+AWS_SECRET_ACCESS_KEY
+
+AWS_REGION → eu-west-2
+
+ECR_REGISTRY → 389890955868.dkr.ecr.eu-west-2.amazonaws.com
+
+Deploy workflow also needs:
+
+EC2_INSTANCE_ID → e.g. i-0abc123...
+
+The IAM user associated to AWS_ACCESS_KEY_ID/SECRET needs permissions for:
+ECR (push), SSM (send/get command), and STS. A simple approach is AmazonEC2ContainerRegistryPowerUser + AmazonSSMFullAccess (tighten later).
+
+How it Works
+Workflow 1 — Build & Push
+Triggers: push to main or manual run.
+
+Builds images from:
+
+./vote → ECR_REGISTRY/vote:latest and :SHORT_SHA
+
+./worker → .../worker:latest and :SHORT_SHA
+
+./result → .../result:latest and :SHORT_SHA
+
+Workflow 2 — Deploy to EC2 (via SSM)
+Triggers automatically after Workflow 1 succeeds, or manual run.
+
+Executes on the instance:
+
+ECR docker login
+
+cd /opt/vote
+
+docker compose pull
+
+docker compose up -d
+
+docker compose ps (for visibility)
+
+No SSH or IP allowlisting needed. ✅
+
+Rollback
+Two options:
+
+Pull a previous SHA tag
+
+Edit /opt/vote/docker-compose.yml on EC2 to pin images, e.g.:
+
+arduino
+Copy code
+image: 389890955868.dkr.ecr.eu-west-2.amazonaws.com/result:<SHORT_SHA>
+Then:
+
+nginx
+Copy code
+docker compose pull && docker compose up -d
+Re-run Workflow 2 after pinning back to a known-good tag.
+
+Tip: You can also add a workflow_dispatch input to deploy a specific SHA automatically.
+
+Common Troubleshooting
+EC2 can’t pull from ECR → Check EC2 role has AmazonEC2ContainerRegistryReadOnly and ECR repos are in the same region.
+
+SSM command fails → Ensure EC2 role has AmazonSSMManagedInstanceCore, instance is “Managed” in SSM, and EC2_INSTANCE_ID is correct.
+
+Result UI not updating → Confirm worker envs match DB (POSTGRES_USER/PASSWORD/DB/HOST) and DB is healthy. Check docker compose logs worker/db.
+
+Ports not reachable → Verify SG inbound rules for 5000/5001, and that the instance has a public IP/Elastic IP.
+
+Build failing in CI → Verify folder paths. We expect Dockerfiles in ./vote, ./worker, ./result.
+
+Manual Deploy (quick)
+From EC2:
+
+bash
+Copy code
+aws ecr get-login-password --region eu-west-2 | docker login --username AWS --password-stdin 389890955868.dkr.ecr.eu-west-2.amazonaws.com
+cd /opt/vote
+docker compose pull && docker compose up -d
