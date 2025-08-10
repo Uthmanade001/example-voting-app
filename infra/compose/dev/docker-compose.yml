@@ -3,8 +3,12 @@ version: "3"
 services:
   redis:
     image: redis:7
-    # no public port (internal only)
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
   db:
     image: postgres:16
@@ -14,31 +18,38 @@ services:
       POSTGRES_DB: votes
     volumes:
       - pgdata:/var/lib/postgresql/data
-    # no public port (internal only)
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   vote:
     image: ${ECR_REGISTRY}/vote:${IMAGE_TAG:-latest}
-    ports:
-      - "5000:80"
+    ports: ["5000:80"]
     depends_on:
-      - redis
-      - db
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
     restart: unless-stopped
 
   worker:
     image: ${ECR_REGISTRY}/worker:${IMAGE_TAG:-latest}
     depends_on:
-      - redis
-      - db
+      redis:
+        condition: service_healthy
+      db:
+        condition: service_healthy
     restart: unless-stopped
 
   result:
     image: ${ECR_REGISTRY}/result:${IMAGE_TAG:-latest}
-    ports:
-      - "5001:80"
+    ports: ["5001:80"]
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
