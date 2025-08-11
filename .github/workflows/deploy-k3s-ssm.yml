@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Image tag to deploy (defaults to the commit SHA)"
+        description: "Image tag to deploy (defaults to commit SHA)"
         required: false
         default: ""
 
@@ -17,7 +17,9 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     env:
+      # Secrets you must have set in repo settings
       ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}          # e.g. 389890955868.dkr.ecr.eu-west-2.amazonaws.com
       EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
       POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
@@ -41,7 +43,9 @@ jobs:
           PW_B64="$(printf %s "$PW" | base64 -w0)"
           echo "pw_b64=${PW_B64}" >> "$GITHUB_OUTPUT"
 
-            - name: Send SSM command (tiny payload, with fallback + debug)
+      # IMPORTANT: scripts/deploy-k3s.sh must exist in your repo (in main)
+      # The SSM payload is tiny: export env -> curl script -> run it.
+      - name: Send SSM command (tiny payload, with fallback + debug)
         id: ssm
         shell: bash
         run: |
@@ -79,6 +83,27 @@ jobs:
 
           echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
           echo "SSM command sent: $CMD_ID"
+
+      - name: Wait for SSM command to finish
+        shell: bash
+        run: |
+          set -e
+          CMD_ID="${{ steps.ssm.outputs.command_id }}"
+          echo "Waiting on SSM Command: $CMD_ID"
+          for i in {1..60}; do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$CMD_ID" --details \
+              --query 'CommandInvocations[0].Status' --output text || true)
+            echo "SSM status: $STATUS"
+            if [ "$STATUS" = "Success" ]; then exit 0; fi
+            if [[ "$STATUS" = "Cancelled" || "$STATUS" = "TimedOut" || "$STATUS" = "Failed" || "$STATUS" = "Undeliverable" || "$STATUS" = "Incomplete" ]]; then
+              echo "SSM command ended with status: $STATUS"
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "Timed out waiting for SSM command to finish"
+          exit 1
 
       - name: Fetch SSM logs (full details)
         if: always()
