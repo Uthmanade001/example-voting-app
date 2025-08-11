@@ -17,7 +17,6 @@ env:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     env:
       ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}          # e.g. 389890955868.dkr.ecr.eu-west-2.amazonaws.com
       EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
@@ -42,12 +41,11 @@ jobs:
           PW_B64="$(printf %s "$PW" | base64 -w0)"
           echo "pw_b64=${PW_B64}" >> "$GITHUB_OUTPUT"
 
-      - name: Send SSM command (install k3s + deploy)
-        id: ssm
+      - name: Build deploy script, inject vars, base64 it
+        id: buildscript
         shell: bash
         run: |
           set -euo pipefail
-
           read -r -d '' USER_SCRIPT <<'EOS'
           set -euo pipefail
           set -x
@@ -104,7 +102,7 @@ jobs:
             --docker-password="$ECR_PW" \
             --dry-run=client -o yaml | k3s kubectl apply -f -
 
-          # 5) Apply workloads (NO wildcards)
+          # 5) Apply workloads (no wildcards)
           k3s kubectl -n voting apply -f "$WORKDIR/k8s/postgres.yaml"
           k3s kubectl -n voting apply -f "$WORKDIR/k8s/redis.yaml"
           k3s kubectl -n voting apply -f "$WORKDIR/k8s/vote.yaml"
@@ -129,12 +127,39 @@ jobs:
           USER_SCRIPT="${USER_SCRIPT//__PDB__/${POSTGRES_DB}}"
           USER_SCRIPT="${USER_SCRIPT//__ECR_PW_B64__/${{ steps.ecrpw.outputs.pw_b64 }}}"
 
-          # Send to SSM
+          # Base64 encode the entire script (single line)
+          B64="$(printf %s "$USER_SCRIPT" | base64 -w0)"
+          echo "script_b64=${B64}" >> "$GITHUB_OUTPUT"
+
+      - name: Send SSM command using params.json (robust)
+        id: ssm
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Create the parameters JSON with two simple commands:
+          # 1) write decoded script to /tmp/deploy.sh
+          # 2) execute it
+          cat > params.json <<JSON
+          {
+            "commands": [
+              "printf %s '${{ steps.buildscript.outputs.script_b64 }}' | base64 -d > /tmp/deploy.sh",
+              "bash /tmp/deploy.sh"
+            ]
+          }
+          JSON
+
           CMD_ID=$(aws ssm send-command \
             --instance-ids "${EC2_INSTANCE_ID}" \
             --document-name "AWS-RunShellScript" \
-            --parameters commands="$(printf '%q' "$USER_SCRIPT")" \
+            --comment "k3s deploy via params.json" \
+            --parameters file://params.json \
             --query "Command.CommandId" --output text)
+
+          if [ -z "$CMD_ID" ] || [ "$CMD_ID" = "None" ]; then
+            echo "Failed to get CommandId from send-command"
+            exit 1
+          fi
+
           echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
           echo "SSM command sent: $CMD_ID"
 
@@ -144,7 +169,7 @@ jobs:
           set -e
           CMD_ID="${{ steps.ssm.outputs.command_id }}"
           echo "Waiting on SSM Command: $CMD_ID"
-          for i in {1..40}; do
+          for i in {1..60}; do
             STATUS=$(aws ssm list-command-invocations \
               --command-id "$CMD_ID" --details \
               --query 'CommandInvocations[0].Status' --output text || true)
@@ -154,7 +179,7 @@ jobs:
               echo "SSM command ended with status: $STATUS"
               exit 1
             fi
-            sleep 10
+            sleep 5
           done
           echo "Timed out waiting for SSM command to finish"
           exit 1
