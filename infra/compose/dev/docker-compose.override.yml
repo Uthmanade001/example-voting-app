@@ -1,0 +1,46 @@
+services:
+  vote:
+    ports: []
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: eu-west-2
+        awslogs-group: /example-voting-app
+        awslogs-stream: vote
+        awslogs-create-group: "true"
+
+  result:
+    ports: []
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: eu-west-2
+        awslogs-group: /example-voting-app
+        awslogs-stream: result
+        awslogs-create-group: "true"
+
+  worker:
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: eu-west-2
+        awslogs-group: /example-voting-app
+        awslogs-stream: worker
+        awslogs-create-group: "true"
+
+  nginx:
+    image: nginx:alpine
+    depends_on:
+      - vote
+      - result
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: eu-west-2
+        awslogs-group: /example-voting-app
+        awslogs-stream: nginx
+        awslogs-create-group: "true"
