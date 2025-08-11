@@ -70,6 +70,8 @@ jobs:
               "docker compose pull",
               "docker compose up -d",
               "docker compose ps"
+           ]'
+
             ]' \
             --query "Command.CommandId" \
             --output text)
