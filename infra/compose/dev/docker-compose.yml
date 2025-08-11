@@ -13,36 +13,28 @@ services:
   db:
     image: postgres:16
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: votes
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    
 
   vote:
     image: ${ECR_REGISTRY}/vote:${IMAGE_TAG:-latest}
-    ports: ["5000:80"]
-    depends_on:
-      redis:
-        condition: service_healthy
-      db:
-        condition: service_healthy
-    restart: unless-stopped
+    environment:
+      REDIS: redis
+      POSTGRES_HOST: db
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
 
   worker:
     image: ${ECR_REGISTRY}/worker:${IMAGE_TAG:-latest}
-    depends_on:
-      redis:
-        condition: service_healthy
-      db:
-        condition: service_healthy
-    restart: unless-stopped
+    environment:
+      REDIS: redis
+      POSTGRES_HOST: db
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
 
   result:
     image: ${ECR_REGISTRY}/result:${IMAGE_TAG:-latest}
