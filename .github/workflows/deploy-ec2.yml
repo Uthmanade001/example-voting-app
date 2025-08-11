@@ -2,7 +2,7 @@ name: Deploy to EC2 via SSM
 
 on:
   workflow_run:
-    workflows: ["Build & Push to ECR"]   # <- must match your build workflow name
+    workflows: ["Build & Push to ECR"]   # <-- must match your build workflow name
     types: [completed]
     branches: [main]
   workflow_dispatch:
@@ -35,7 +35,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Resolve IMAGE_TAG (use the built commit on auto-trigger)
+      - name: Resolve IMAGE_TAG (built commit when auto-triggered)
         id: tag
         shell: bash
         run: |
@@ -60,6 +60,7 @@ jobs:
               "cd /opt/vote",
               "echo ECR_REGISTRY='"${ECR_REGISTRY}"' > .env",
               "echo IMAGE_TAG='"${IMAGE_TAG}"' >> .env",
+              "aws ssm get-parameters --names POSTGRES_USER POSTGRES_PASSWORD POSTGRES_DB --with-decryption --query \\\"Parameters[*].[Name,Value]\\\" --output text | while read name value; do echo \\\"$name=$value\\\" >> .env; done",
               "aws ecr get-login-password --region '"${AWS_REGION}"' | docker login --username AWS --password-stdin '"${ECR_REGISTRY}"'",
               "docker compose pull",
               "docker compose up -d",
