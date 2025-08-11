@@ -33,13 +33,14 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Get ECR password on runner
+      - name: Get ECR password on runner (base64-encode)
         id: ecrpw
         shell: bash
         run: |
           set -euo pipefail
           PW="$(aws ecr get-login-password --region "${AWS_REGION}")"
-          echo "pw=${PW}" >> "$GITHUB_OUTPUT"
+          PW_B64="$(printf %s "$PW" | base64 -w0)"
+          echo "pw_b64=${PW_B64}" >> "$GITHUB_OUTPUT"
 
       - name: Send SSM command (install k3s + deploy)
         id: ssm
@@ -52,14 +53,14 @@ jobs:
           set -x
 
           AWS_REGION="__AWS_REGION__"
-          ECR="__ECR__"       # e.g. 389890955868.dkr.ecr.eu-west-2.amazonaws.com
-          TAG="__TAG__"       # commit SHA or a specific tag
+          ECR="__ECR__"
+          TAG="__TAG__"
           PUSER="__PUSER__"
           PPASS="__PPASS__"
           PDB="__PDB__"
-          ECR_PW="__ECR_PW__"
+          ECR_PW_B64="__ECR_PW_B64__"
 
-          # 1) Install k3s if missing (make kubeconfig readable to avoid permission errors)
+          # 1) Install k3s if missing (make kubeconfig readable)
           if ! command -v k3s >/dev/null 2>&1; then
             curl -sfL https://get.k3s.io | env K3S_KUBECONFIG_MODE=644 sh -
           fi
@@ -75,7 +76,7 @@ jobs:
 
           export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
-          # 2) Download repo at the exact commit/tag we’re deploying
+          # 2) Download repo at the exact commit/tag
           WORKDIR=/opt/k8s
           rm -rf "$WORKDIR"
           mkdir -p "$WORKDIR"
@@ -94,15 +95,16 @@ jobs:
             --from-literal=POSTGRES_DB="$PDB" \
             --dry-run=client -o yaml | k3s kubectl apply -f -
 
-          # Create ECR imagePull secret using password computed on the runner
+          # ECR imagePull secret (password supplied by runner; decode safely)
           REG_SERVER="${ECR#https://}"
+          ECR_PW="$(echo "$ECR_PW_B64" | base64 -d)"
           k3s kubectl -n voting create secret docker-registry ecr-creds \
             --docker-server="$REG_SERVER" \
             --docker-username=AWS \
             --docker-password="$ECR_PW" \
             --dry-run=client -o yaml | k3s kubectl apply -f -
 
-          # 5) Apply workloads
+          # 5) Apply workloads (NO wildcards)
           k3s kubectl -n voting apply -f "$WORKDIR/k8s/postgres.yaml"
           k3s kubectl -n voting apply -f "$WORKDIR/k8s/redis.yaml"
           k3s kubectl -n voting apply -f "$WORKDIR/k8s/vote.yaml"
@@ -125,7 +127,7 @@ jobs:
           USER_SCRIPT="${USER_SCRIPT//__PUSER__/${POSTGRES_USER}}"
           USER_SCRIPT="${USER_SCRIPT//__PPASS__/${POSTGRES_PASSWORD}}"
           USER_SCRIPT="${USER_SCRIPT//__PDB__/${POSTGRES_DB}}"
-          USER_SCRIPT="${USER_SCRIPT//__ECR_PW__/${{ steps.ecrpw.outputs.pw }}}"
+          USER_SCRIPT="${USER_SCRIPT//__ECR_PW_B64__/${{ steps.ecrpw.outputs.pw_b64 }}}"
 
           # Send to SSM
           CMD_ID=$(aws ssm send-command \
@@ -136,6 +138,27 @@ jobs:
           echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
           echo "SSM command sent: $CMD_ID"
 
+      - name: Wait for SSM command to finish
+        shell: bash
+        run: |
+          set -e
+          CMD_ID="${{ steps.ssm.outputs.command_id }}"
+          echo "Waiting on SSM Command: $CMD_ID"
+          for i in {1..40}; do
+            STATUS=$(aws ssm list-command-invocations \
+              --command-id "$CMD_ID" --details \
+              --query 'CommandInvocations[0].Status' --output text || true)
+            echo "SSM status: $STATUS"
+            if [ "$STATUS" = "Success" ]; then exit 0; fi
+            if [[ "$STATUS" = "Cancelled" || "$STATUS" = "TimedOut" || "$STATUS" = "Failed" || "$STATUS" = "Undeliverable" || "$STATUS" = "Incomplete" ]]; then
+              echo "SSM command ended with status: $STATUS"
+              exit 1
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for SSM command to finish"
+          exit 1
+
       - name: Fetch SSM logs
         if: always()
         shell: bash
@@ -143,20 +166,6 @@ jobs:
           set -euo pipefail
           CMD_ID="${{ steps.ssm.outputs.command_id }}"
           INSTANCE="${EC2_INSTANCE_ID}"
-
-          for i in {1..60}; do
-            STATUS=$(aws ssm list-command-invocations \
-              --command-id "$CMD_ID" \
-              --details \
-              --query "CommandInvocations[0].Status" \
-              --output text 2>/dev/null || true)
-            echo "Status: $STATUS"
-            if [[ "$STATUS" == "Success" || "$STATUS" == "Cancelled" || "$STATUS" == "Failed" || "$STATUS" == "TimedOut" ]]; then
-              break
-            fi
-            sleep 5
-          done
-
           aws ssm get-command-invocation \
             --command-id "$CMD_ID" \
             --instance-id "$INSTANCE" \
