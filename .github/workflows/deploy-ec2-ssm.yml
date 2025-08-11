@@ -49,7 +49,94 @@ jobs:
           fi
           echo "Using IMAGE_TAG=$IMAGE_TAG"
 
-      - name: Send SSM Run Command (with Nginx + CloudWatch logs)
+      # Build nginx.conf and docker-compose.override.yml, then base64 them (clean and readable)
+      - name: Build proxy config (base64)
+        id: build_cfg
+        shell: bash
+        run: |
+          set -e
+
+          cat > override.yml <<'YAML'
+          services:
+            vote:
+              ports: []
+              logging:
+                driver: awslogs
+                options:
+                  awslogs-region: eu-west-2
+                  awslogs-group: /example-voting-app
+                  awslogs-stream: vote
+                  awslogs-create-group: "true"
+
+            result:
+              ports: []
+              logging:
+                driver: awslogs
+                options:
+                  awslogs-region: eu-west-2
+                  awslogs-group: /example-voting-app
+                  awslogs-stream: result
+                  awslogs-create-group: "true"
+
+            worker:
+              logging:
+                driver: awslogs
+                options:
+                  awslogs-region: eu-west-2
+                  awslogs-group: /example-voting-app
+                  awslogs-stream: worker
+                  awslogs-create-group: "true"
+
+            nginx:
+              image: nginx:alpine
+              depends_on:
+                - vote
+                - result
+              ports:
+                - "80:80"
+              volumes:
+                - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+              logging:
+                driver: awslogs
+                options:
+                  awslogs-region: eu-west-2
+                  awslogs-group: /example-voting-app
+                  awslogs-stream: nginx
+                  awslogs-create-group: "true"
+          YAML
+
+          cat > nginx.conf <<'NGINX'
+          server {
+            listen 80;
+            server_name _;
+            client_max_body_size 10m;
+
+            location /healthz {
+              return 200 'ok';
+              add_header Content-Type text/plain;
+            }
+
+            location / {
+              proxy_pass http://vote;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+            }
+
+            location /result/ {
+              proxy_pass http://result/;
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+            }
+          }
+          NGINX
+
+          base64 -w0 override.yml > override.b64
+          base64 -w0 nginx.conf > nginx.b64
+
+          echo "OVERRIDE_B64=$(cat override.b64)" >> $GITHUB_ENV
+          echo "NGINX_CONF_B64=$(cat nginx.b64)" >> $GITHUB_ENV
+
+      - name: Send SSM Run Command (deploy with Nginx + logs)
         id: ssm
         shell: bash
         run: |
@@ -62,93 +149,17 @@ jobs:
               "sudo systemctl enable --now docker || true",
               "cd /opt/vote",
 
-              # ensure CloudWatch log group exists
               "aws logs create-log-group --log-group-name /example-voting-app || true",
 
-              # write docker-compose.override.yml (remove vote/result ports, add nginx, add awslogs)
-              "printf '\''%s\\n'\'' \
-services: \
-\"  vote:\" \
-\"    ports: []\" \
-\"    logging:\" \
-\"      driver: awslogs\" \
-\"      options:\" \
-\"        awslogs-region: eu-west-2\" \
-\"        awslogs-group: /example-voting-app\" \
-\"        awslogs-stream: vote\" \
-\"        awslogs-create-group: \\\"true\\\"\" \
-\"\" \
-\"  result:\" \
-\"    ports: []\" \
-\"    logging:\" \
-\"      driver: awslogs\" \
-\"      options:\" \
-\"        awslogs-region: eu-west-2\" \
-\"        awslogs-group: /example-voting-app\" \
-\"        awslogs-stream: result\" \
-\"        awslogs-create-group: \\\"true\\\"\" \
-\"\" \
-\"  worker:\" \
-\"    logging:\" \
-\"      driver: awslogs\" \
-\"      options:\" \
-\"        awslogs-region: eu-west-2\" \
-\"        awslogs-group: /example-voting-app\" \
-\"        awslogs-stream: worker\" \
-\"        awslogs-create-group: \\\"true\\\"\" \
-\"\" \
-\"  nginx:\" \
-\"    image: nginx:alpine\" \
-\"    depends_on:\" \
-\"      - vote\" \
-\"      - result\" \
-\"    ports:\" \
-\"      - \\\"80:80\\\"\" \
-\"    volumes:\" \
-\"      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro\" \
-\"    logging:\" \
-\"      driver: awslogs\" \
-\"      options:\" \
-\"        awslogs-region: eu-west-2\" \
-\"        awslogs-group: /example-voting-app\" \
-\"        awslogs-stream: nginx\" \
-\"        awslogs-create-group: \\\"true\\\"\" \
-              > docker-compose.override.yml",
+              "echo '"${OVERRIDE_B64}"' | base64 -d > docker-compose.override.yml",
+              "echo '"${NGINX_CONF_B64}"' | base64 -d > nginx.conf",
 
-              # write nginx.conf
-              "printf '\''%s\\n'\'' \
-\"server {\" \
-\"  listen 80;\" \
-\"  server_name _;\" \
-\"  client_max_body_size 10m;\" \
-\"\" \
-\"  location /healthz {\" \
-\"    return 200 'ok';\" \
-\"    add_header Content-Type text/plain;\" \
-\"  }\" \
-\"\" \
-\"  location / {\" \
-\"    proxy_pass http://vote;\" \
-\"    proxy_set_header Host \\$host;\" \
-\"    proxy_set_header X-Real-IP \\$remote_addr;\" \
-\"  }\" \
-\"\" \
-\"  location /result/ {\" \
-\"    proxy_pass http://result/;\" \
-\"    proxy_set_header Host \\$host;\" \
-\"    proxy_set_header X-Real-IP \\$remote_addr;\" \
-\"  }\" \
-\"}\" \
-              > nginx.conf",
-
-              # compose env from GitHub Secrets + tag
               "echo ECR_REGISTRY='"${ECR_REGISTRY}"' > .env",
               "echo IMAGE_TAG='"${IMAGE_TAG}"' >> .env",
               "echo POSTGRES_USER='"${POSTGRES_USER}"' >> .env",
               "echo POSTGRES_PASSWORD='"${POSTGRES_PASSWORD}"' >> .env",
               "echo POSTGRES_DB='"${POSTGRES_DB}"' >> .env",
 
-              # deploy
               "aws ecr get-login-password --region '"${AWS_REGION}"' | docker login --username AWS --password-stdin '"${ECR_REGISTRY}"'",
               "docker compose pull",
               "docker compose up -d",
