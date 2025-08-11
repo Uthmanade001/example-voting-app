@@ -6,13 +6,12 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Image tag to deploy (defaults to commit SHA)"
+        description: "Image tag to deploy (defaults to the commit SHA)"
         required: false
         default: ""
 
 env:
   AWS_REGION: eu-west-2
-  # Default tag is the commit SHA; can be overridden by workflow_dispatch input
   IMAGE_TAG: ${{ github.event.inputs.image_tag != '' && github.event.inputs.image_tag || github.sha }}
 
 jobs:
@@ -20,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+      ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}          # e.g. 389890955868.dkr.ecr.eu-west-2.amazonaws.com
       EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
       POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
       POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
@@ -34,83 +33,88 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Send SSM command (deploy k3s)
+      - name: Send SSM command (install k3s + deploy)
         id: ssm
         shell: bash
         run: |
           set -euo pipefail
 
-          # Build one safe script to run on the instance
+          # Script that actually runs on the EC2 instance (as root via SSM)
           read -r -d '' USER_SCRIPT <<'EOS'
           set -euo pipefail
           set -x
 
           AWS_REGION="__AWS_REGION__"
-          ECR="__ECR__"                 # e.g. 389890955868.dkr.ecr.eu-west-2.amazonaws.com
-          TAG="__TAG__"                 # commit SHA or a specific tag
+          ECR="__ECR__"       # e.g. 389890955868.dkr.ecr.eu-west-2.amazonaws.com
+          TAG="__TAG__"       # commit SHA or a specific tag
           PUSER="__PUSER__"
           PPASS="__PPASS__"
           PDB="__PDB__"
 
-          # Install k3s if missing (includes kubectl)
+          # ---------- 1) Install k3s if missing (and make kubeconfig readable) ----------
           if ! command -v k3s >/dev/null 2>&1; then
-            curl -sfL https://get.k3s.io | sh -;
+            # K3S_KUBECONFIG_MODE=644 avoids "permission denied" on /etc/rancher/k3s/k3s.yaml
+            curl -sfL https://get.k3s.io | env K3S_KUBECONFIG_MODE=644 sh -
           fi
 
           # Ensure curl exists (Amazon Linux/Ubuntu)
           if ! command -v curl >/dev/null 2>&1; then
             if command -v yum >/dev/null 2>&1; then
-              sudo yum install -y curl
+              yum install -y curl
             else
-              sudo apt-get update -y && sudo apt-get install -y curl
+              apt-get update -y && apt-get install -y curl
             fi
           fi
 
+          # Make kubectl use k3s kubeconfig explicitly (safe even when running as root)
+          export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+
+          # ---------- 2) Get the repo at the exact commit/tag we’re deploying ----------
           WORKDIR=/opt/k8s
           rm -rf "$WORKDIR"
           mkdir -p "$WORKDIR"
 
-          # Download the repo at the exact commit/tag we're deploying
-          # (This avoids sending a giant base64 tarball via SSM)
           curl -L "https://github.com/Uthmanade001/example-voting-app/archive/${TAG}.tar.gz" -o /tmp/repo.tgz
           tar xzf /tmp/repo.tgz -C "$WORKDIR" --strip-components=1
 
-          # Replace placeholders in manifests
+          # ---------- 3) Replace placeholders in k8s manifests ----------
           sed -i "s|__ECR__|$ECR|g; s|__TAG__|$TAG|g" "$WORKDIR"/k8s/*.yaml
 
-          # Apply namespace first
+          # ---------- 4) Namespace & Secrets ----------
           k3s kubectl apply -f "$WORKDIR/k8s/namespace.yaml"
 
-          # DB secret from provided values
+          # Postgres credentials
           k3s kubectl -n voting create secret generic db \
             --from-literal=POSTGRES_USER="$PUSER" \
             --from-literal=POSTGRES_PASSWORD="$PPASS" \
             --from-literal=POSTGRES_DB="$PDB" \
             --dry-run=client -o yaml | k3s kubectl apply -f -
 
-          # ECR image pull secret (token valid ~12h)
-          REG_SERVER="${ECR#https://}"  # normalize if a scheme sneaks in
+          # ECR pull secret (token valid ~12h)
+          REG_SERVER="${ECR#https://}"
           k3s kubectl -n voting create secret docker-registry ecr-creds \
             --docker-server="$REG_SERVER" \
             --docker-username=AWS \
             --docker-password="$(aws ecr get-login-password --region "$AWS_REGION")" \
             --dry-run=client -o yaml | k3s kubectl apply -f -
 
-          # Apply workloads in a predictable order
+          # ---------- 5) Apply workloads in order ----------
           k3s kubectl -n voting apply -f "$WORKDIR/k8s/postgres.yaml"
           k3s kubectl -n voting apply -f "$WORKDIR/k8s/redis.yaml"
           k3s kubectl -n voting apply -f "$WORKDIR/k8s/vote.yaml"
           k3s kubectl -n voting apply -f "$WORKDIR/k8s/result.yaml"
           k3s kubectl -n voting apply -f "$WORKDIR/k8s/worker.yaml"
 
-          # Wait and show status (don't fail pipeline on rollout waits)
+          # ---------- 6) Rollout status & diagnostics ----------
           k3s kubectl -n voting rollout status deployment/redis --timeout=180s || true
           k3s kubectl -n voting rollout status deployment/vote --timeout=180s || true
           k3s kubectl -n voting rollout status deployment/result --timeout=180s || true
           k3s kubectl -n voting rollout status deployment/worker --timeout=180s || true
 
-          k3s kubectl -n voting get pods -o wide
-          k3s kubectl -n voting get svc -o wide
+          echo "--- PODS ---"
+          k3s kubectl -n voting get pods -o wide || true
+          echo "--- SERVICES ---"
+          k3s kubectl -n voting get svc -o wide || true
           EOS
 
           # Inject values
@@ -121,13 +125,12 @@ jobs:
           USER_SCRIPT="${USER_SCRIPT//__PPASS__/${POSTGRES_PASSWORD}}"
           USER_SCRIPT="${USER_SCRIPT//__PDB__/${POSTGRES_DB}}"
 
-          # Send the command
+          # Send to SSM
           CMD_ID=$(aws ssm send-command \
             --instance-ids "${EC2_INSTANCE_ID}" \
             --document-name "AWS-RunShellScript" \
             --parameters commands="$(printf '%q' "$USER_SCRIPT")" \
             --query "Command.CommandId" --output text)
-
           echo "command_id=$CMD_ID" >> "$GITHUB_OUTPUT"
           echo "SSM command sent: $CMD_ID"
 
@@ -139,14 +142,13 @@ jobs:
           CMD_ID="${{ steps.ssm.outputs.command_id }}"
           INSTANCE="${EC2_INSTANCE_ID}"
 
-          # Poll until finished
+          # Poll until the command completes
           for i in {1..60}; do
             STATUS=$(aws ssm list-command-invocations \
               --command-id "$CMD_ID" \
               --details \
               --query "CommandInvocations[0].Status" \
               --output text 2>/dev/null || true)
-
             echo "Status: $STATUS"
             if [[ "$STATUS" == "Success" || "$STATUS" == "Cancelled" || "$STATUS" == "Failed" || "$STATUS" == "TimedOut" ]]; then
               break
